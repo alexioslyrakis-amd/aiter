@@ -68,6 +68,10 @@ if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
+# Persistent per-rank scatter only: waves 0-1 own every TDM load and waves 2-3
+# every scatter store, C gets its own LDS region, and a tile's stores drain
+# under the next tile's mainloop instead of before it.
+PERSISTENT_OVERLAP = int(os.environ.get("AITER_FLYDSL_PERSISTENT_OVERLAP", "0"))
 if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
     raise ValueError("AITER_FLYDSL_MMA_GROUP values must be positive")
 if DS_FIRST_N < 0:
@@ -200,10 +204,16 @@ def launch_gemm_a8w4_tdm(
        check -- so the callers that choose cluster_n enforce it
        (batched_gemm_mxfp4._pick_cluster_n and its assert).
     """
+    persistent_overlap = bool(
+        PERSISTENT_OVERLAP
+        and persistent_workers
+        and enable_ep_scatter
+        and ep_scatter_per_rank
+    )
     if persistent_workers:
         assert cluster_m == 1, "persistent workers require cluster_m=1"
         assert persistent_workers % cluster_n == 0
-        assert not (
+        assert persistent_overlap or not (
             enable_ep_scatter and ep_quant_bits
         ), "persistent EP scatter requires an unquantized combine wire"
     # Resolve per-row settings before specializing the layout and cache key.
@@ -276,6 +286,7 @@ def launch_gemm_a8w4_tdm(
         ep_scatter_per_rank,
         persistent_workers,
         rolled_drain,
+        persistent_overlap,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -320,6 +331,13 @@ def launch_gemm_a8w4_tdm(
     ) // SCATTER_PASSES_PER_VECTOR
     if (4 * num_waves_per_tensor_tdm) % num_waves:
         raise ValueError("A/B/SA/SB ownership must cover every workgroup wave")
+    # Waves that issue the rotating TDM loads. The rest never wait on tensorcnt
+    # in the mainloop, so their in-flight scatter stores cannot stall it.
+    LOAD_WAVES = 2 if persistent_overlap else num_waves
+    if persistent_overlap:
+        assert num_waves == 4, "persistent overlap needs two load and two store waves"
+        assert cluster_n == 1, "persistent overlap does not pair multicast loads"
+        assert not tdm_as_in_prologue, "persistent overlap owns every load on waves 0-1"
 
     A_PACK = 2 if a_is_fp4 else 1
     A_ROW_B = tile_k // A_PACK
@@ -405,7 +423,19 @@ def launch_gemm_a8w4_tdm(
     )
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
-    ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
+    # Overlap keeps C apart from the input stages: the next tile's loads land
+    # while the scatter stores still read C.
+    C_LDS_OFF = ceildiv(INPUT_LDS_B, 128) * 128 if persistent_overlap else 0
+    ARENA_B = (
+        C_LDS_OFF + C_STORE_B
+        if persistent_overlap
+        else max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
+    )
+    if persistent_overlap and ARENA_B > 320 * 1024:
+        raise ValueError(
+            f"persistent overlap needs {ARENA_B} B of LDS for inputs + C, "
+            "over the 320 KiB gfx1250 limit; lower num_buffers or the C wire width"
+        )
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -445,6 +475,7 @@ def launch_gemm_a8w4_tdm(
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
+    _drain = _drain + ("_ovl" if persistent_overlap else "")
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -710,6 +741,10 @@ def launch_gemm_a8w4_tdm(
             # is split across all four waves along its K-scale dimension.
             waves = [(2,), (0, 1), (0, 1, 2, 3), (3,)]
             TDM_PER = 1
+        elif const_expr(LOAD_WAVES < num_waves):
+            # A and A-scale on wave 0, B and B-scale on wave 1.
+            waves = [(i % LOAD_WAVES,) for i in range(4)]
+            TDM_PER = 4 // LOAD_WAVES
         else:
             wave_groups = [
                 tuple(range(i, i + num_waves_per_tensor_tdm))
@@ -956,6 +991,19 @@ def launch_gemm_a8w4_tdm(
             for g in range_constexpr(len(job_waves)):
                 if owns(job_waves[g]):
                     fn([j for j in jobs if j.waves == job_waves[g]])
+            if const_expr(LOAD_WAVES < num_waves):
+                # The mainloop body also computes, so loadless waves run it too.
+                if wave >= fx.Int32(LOAD_WAVES):
+                    fn([])
+
+        def tile_fence(outstanding=0):
+            """pipeline_fence whose tensorcnt wait only the load waves take."""
+            if const_expr(LOAD_WAVES < num_waves):
+                if wave < fx.Int32(LOAD_WAVES):
+                    tdm_ops.tensor_wait(outstanding)
+                workgroup_barrier()
+            else:
+                pipeline_fence(outstanding=outstanding)
 
         def issue_as_prologue():
             """Loads the full A-scale K range into its resident LDS buffer."""
@@ -1248,7 +1296,7 @@ def launch_gemm_a8w4_tdm(
             if const_expr(fence_fn is not None):
                 fence_fn()
             elif const_expr(num_outstanding_tdm is not None):
-                pipeline_fence(outstanding=num_outstanding_tdm)
+                tile_fence(outstanding=num_outstanding_tdm)
             if const_expr(issue_fn is not None):
                 issue_fn()
             if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
@@ -1517,7 +1565,7 @@ def launch_gemm_a8w4_tdm(
                             s = kt % num_buffers
                             buf = s
                             if const_expr(not next_stage_on):
-                                pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+                                tile_fence(outstanding=TDM_PER * (num_buffers - 1))
                             next_stage_buf = (
                                 (kt + 1) % num_buffers
                                 if const_expr(next_stage_on)
@@ -1552,7 +1600,7 @@ def launch_gemm_a8w4_tdm(
                         kt = n_steady + j
                         buf = kt % num_buffers
                         has_next = next_stage_on and j + 1 < num_buffers
-                        pipeline_fence(
+                        tile_fence(
                             outstanding=TDM_PER
                             * max(0, num_buffers - 1 - j - (1 if has_next else 0))
                         )
@@ -1575,7 +1623,7 @@ def launch_gemm_a8w4_tdm(
                         issue(i, i)
                     n_steady = K_TILES - PRE
                     if const_expr(next_stage_on):
-                        pipeline_fence(outstanding=TDM_PER * (PRE - 1))
+                        tile_fence(outstanding=TDM_PER * (PRE - 1))
                         first_lds_addr = calc_lds_addr(0)
                         rocdl.sched_barrier(0)
                         load_lds_data(
@@ -1587,7 +1635,7 @@ def launch_gemm_a8w4_tdm(
                     def steady_mid_iteration(my_jobs, kt, s):
                         buf = s
                         if const_expr(not next_stage_on):
-                            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+                            tile_fence(outstanding=TDM_PER * (num_buffers - 2))
                             rocdl.sched_barrier(0)
                             issue(
                                 (kt + PRE) % num_buffers,
@@ -1641,12 +1689,12 @@ def launch_gemm_a8w4_tdm(
                         if const_expr(rolled_drain):
                             for wait_stage in range_constexpr(PRE):
                                 if j == wait_stage:
-                                    pipeline_fence(
+                                    tile_fence(
                                         outstanding=TDM_PER
                                         * max(0, num_buffers - 2 - wait_stage)
                                     )
                         else:
-                            pipeline_fence(
+                            tile_fence(
                                 outstanding=TDM_PER * max(0, num_buffers - 2 - j)
                             )
 
@@ -1703,7 +1751,11 @@ def launch_gemm_a8w4_tdm(
                     )
             # The epilogue restages C in this arena. Draining our own tensorcnt
             # suffices: peer multicast loads are pairwise matched with ours.
+            # Under overlap this is also where the store waves retire the
+            # previous tile's scatter before C is rewritten.
             pipeline_fence(outstanding=0)
+            stC_c = stC_idx + C_LDS_OFF if const_expr(C_LDS_OFF) else stC_idx
+            c_base_ptr = base_ptr + C_LDS_OFF if const_expr(C_LDS_OFF) else base_ptr
             is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
             STORE_N = tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
             # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
@@ -1839,12 +1891,12 @@ def launch_gemm_a8w4_tdm(
                                     col_fp4_1 = (wnb + wn1 * 16) // 4 + kgrp * 2
                                     row_byte = row_rel * STORE_N
                                     lds_store_b16(
-                                        stC_idx,
+                                        stC_c,
                                         row_byte + col_fp4_0,
                                         packed_i32,
                                     )
                                     lds_store_b16(
-                                        stC_idx,
+                                        stC_c,
                                         row_byte + col_fp4_1,
                                         packed_i32 >> fx.Int32(16),
                                     )
@@ -1866,7 +1918,7 @@ def launch_gemm_a8w4_tdm(
                                         packed_i32 = fx.Vector(packed_v2i32)[sub]
                                         col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
                                         lds_store_b32(
-                                            stC_idx,
+                                            stC_c,
                                             row_rel * STORE_N + col_fp8,
                                             Vec.from_elements([packed_i32], fx.Int32),
                                         )
@@ -1939,7 +1991,7 @@ def launch_gemm_a8w4_tdm(
                         address_space=fx.AddressSpace.Shared,
                         alignment=1,
                     )
-                    _scale_lds = fx.recast_iter(_p8_scale, base_ptr)
+                    _scale_lds = fx.recast_iter(_p8_scale, c_base_ptr)
                     for wm in range_constexpr(wmma_m_rep):
                         row_rel = wmb + wm * 16 + lane16
                         _wf = _wf_rows[wm]
@@ -1976,7 +2028,7 @@ def launch_gemm_a8w4_tdm(
                                 # on the fp4 one.
                                 if const_expr(ep_quant_bits == 8):
                                     lds_store_b64(
-                                        stC_idx,
+                                        stC_c,
                                         _row_byte + col_rel,
                                         emit_cvt_scalef32_pk8_fp8_f32(
                                             _src8,
@@ -1987,7 +2039,7 @@ def launch_gemm_a8w4_tdm(
                                     )
                                 else:
                                     lds_store_b32(
-                                        stC_idx,
+                                        stC_c,
                                         _row_byte + col_rel // 2,
                                         Vec.from_elements(
                                             [
@@ -2019,7 +2071,7 @@ def launch_gemm_a8w4_tdm(
                                         _e8m0_blks[dw * 4 : dw * 4 + 4]
                                     )
                                     lds_store_b32(
-                                        stC_idx,
+                                        stC_c,
                                         _sc_byte + dw * 4,
                                         Vec.from_elements([_packed], fx.Int32),
                                     )
@@ -2058,7 +2110,7 @@ def launch_gemm_a8w4_tdm(
                                     ]
                                 hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
                                 lds_store_b64(
-                                    stC_idx,
+                                    stC_c,
                                     (row_rel * STORE_N + col_rel // 2) * 2,
                                     hv.bitcast(fx.Int32).ir_value(),
                                 )
@@ -2077,7 +2129,7 @@ def launch_gemm_a8w4_tdm(
                                     ).to(oc)
                                 hv_i32 = hv.bitcast(fx.Int32).ir_value()
                                 lds_store_b128(
-                                    stC_idx,
+                                    stC_c,
                                     (row_rel * STORE_PITCH + col_rel) * 2,
                                     hv_i32,
                                 )
@@ -2105,7 +2157,7 @@ def launch_gemm_a8w4_tdm(
                 _pr = _ep_lsa1 - _ep_lsa0
                 _comb0 = _ep_lsa0 + fx.Int64(ep_combine_input_offset)
                 _lds_c0 = fx.Int32(
-                    arith.trunci(T.i32, arith.unwrap(fx.Int64(fx.ptrtoint(base_ptr))))
+                    arith.trunci(T.i32, arith.unwrap(fx.Int64(fx.ptrtoint(c_base_ptr))))
                 )
                 if const_expr(ep_quant_bits):
                     _elem_div = 8 // ep_quant_bits
@@ -2136,7 +2188,12 @@ def launch_gemm_a8w4_tdm(
                     run_lo = (run_lo > blk_m).select(run_lo, blk_m)
                     run_hi = (run_hi < _tile_end).select(run_hi, _tile_end)
                     run_rows = run_hi - run_lo
-                    if (wave == fx.Int32(p % num_waves)) & (run_rows > fx.Int32(0)):
+                    store_wave = (
+                        LOAD_WAVES + p % (num_waves - LOAD_WAVES)
+                        if const_expr(persistent_overlap)
+                        else p % num_waves
+                    )
+                    if (wave == fx.Int32(store_wave)) & (run_rows > fx.Int32(0)):
                         r0 = run_lo - blk_m
                         slot = run_lo + _run_lane(_run_delta_lanes, p)
                         dst = (
@@ -2173,7 +2230,8 @@ def launch_gemm_a8w4_tdm(
                                     ep_slot_stride_bytes,
                                 ),
                             )
-                tdm_ops.tensor_wait(0)
+                if const_expr(not persistent_overlap):
+                    tdm_ops.tensor_wait(0)
             elif const_expr(enable_ep_scatter):
                 # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
                 # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
@@ -2208,7 +2266,7 @@ def launch_gemm_a8w4_tdm(
                     _comb_iter, (_oob, _row_elems), (_stride_elems, 1)
                 )
                 _lds_c = tensor_view(
-                    fx.recast_iter(fx.Int8 if ep_quant_bits else oc, base_ptr),
+                    fx.recast_iter(fx.Int8 if ep_quant_bits else oc, c_base_ptr),
                     (tile_m, _lds_row_elems),
                     (_lds_row_elems, 1),
                 )
@@ -2328,7 +2386,7 @@ def launch_gemm_a8w4_tdm(
                     )
                     atomC = make_tdm_store(gtC, mn_oob, out_stride)
                     src = tensor_view(
-                        fx.recast_iter(oc_store, base_ptr),
+                        fx.recast_iter(oc_store, c_base_ptr),
                         (tile_m, STORE_N),
                         (STORE_N, 1),
                     )
@@ -2345,7 +2403,7 @@ def launch_gemm_a8w4_tdm(
                         num_warps=num_waves,
                     )
                     src = tensor_view(
-                        fx.recast_iter(oc_store, base_ptr),
+                        fx.recast_iter(oc_store, c_base_ptr),
                         (tile_m, STORE_PITCH),
                         (STORE_PITCH, 1),
                     )
@@ -2354,10 +2412,11 @@ def launch_gemm_a8w4_tdm(
                     rocdl.s_wait_storecnt(0)
                 tdm_ops.tensor_wait(0)
 
-        if const_expr(persistent_workers > 0):
+        if const_expr(persistent_workers > 0 and not persistent_overlap):
             # Every wave must retire the output store before another wave
             # reuses the same LDS arena for the next task's input. This also
-            # covers the fused scatter's tensor_wait above.
+            # covers the fused scatter's tensor_wait above. Overlap stages C
+            # outside the input stages, so the next tile may start at once.
             workgroup_barrier()
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -2413,6 +2472,9 @@ def launch_gemm_a8w4_tdm(
             tasks = ceildiv(rows, tile_m) * ceildiv(i32_n, tile_n)
             for task_id in range(fx.block_idx.x, tasks, persistent_workers):
                 run_task(task_id, rows)
+            if const_expr(persistent_overlap):
+                # The last tile's scatter still reads C; keep LDS alive.
+                tdm_ops.tensor_wait(0)
         else:
             run_task(fx.block_idx.x, i32_m)
 

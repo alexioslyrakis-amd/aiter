@@ -175,7 +175,13 @@ def flydsl_grouped_gemm_a8w4_masked(
     if persistent_workers:
         if cluster_m != 1:
             raise ValueError("persistent workers require cluster_m=1")
-        if stage2_scatter is not None and stage2_scatter.combine_quant_bits:
+        from .kernels.mxfp4_preshuffle_gfx1250_tdm import PERSISTENT_OVERLAP
+
+        if (
+            stage2_scatter is not None
+            and stage2_scatter.combine_quant_bits
+            and not (PERSISTENT_OVERLAP and stage2_scatter.per_rank_scatter)
+        ):
             raise ValueError(
                 "persistent EP scatter requires an unquantized combine wire"
             )
