@@ -978,7 +978,10 @@ class MegaMoEGfx1250:
         topk_ids: torch.Tensor,
         recv_token_bound: int | None = None,
     ) -> None:
-        """Launch ``tdm_compact_plan`` on a side stream into the current slot.
+        """Launch ``tdm_compact_plan`` into the current slot.
+
+        The plan runs on the current stream unless AITER_MEGA_PLAN_SIDE_STREAM=1
+        moves it to a side stream.
 
         The plan only needs ``topk_ids``, so the caller can hide the first
         layer's plan behind RMSNorm. Later layers should pass ``next_topk_ids``
@@ -1021,8 +1024,9 @@ class MegaMoEGfx1250:
         slot = int(self._compact_slot if slot is None else slot)
         bufs = self._compact_slot_bufs(slot)
         cur = torch.cuda.current_stream()
-        plan_stream = self._compact_plan_stream
-        plan_stream.wait_stream(cur)
+        plan_stream = self._compact_plan_stream or cur
+        if plan_stream is not cur:
+            plan_stream.wait_stream(cur)
         with torch.cuda.stream(plan_stream):
             self._compact_plan_for(self._compact_step_align_m, slot)(
                 self._arena.handle,
@@ -1038,13 +1042,15 @@ class MegaMoEGfx1250:
                 token_count,
                 fx.Stream(plan_stream),
             )
-        self._compact_plan_event.record(plan_stream)
+        if plan_stream is not cur:
+            self._compact_plan_event.record(plan_stream)
         self._compact_plan_pending = True
 
     def _wait_compact_plan(self) -> None:
         if not self._compact_plan_pending:
             return
-        torch.cuda.current_stream().wait_event(self._compact_plan_event)
+        if self._compact_plan_stream is not None:
+            torch.cuda.current_stream().wait_event(self._compact_plan_event)
         self._compact_plan_pending = False
 
     def _compact_slot_bufs(self, slot: int) -> dict:
@@ -1266,7 +1272,14 @@ class MegaMoEGfx1250:
             self._compact_dummy_wts = torch.zeros(
                 (1, config.topk), dtype=torch.float32, device=device
             )
-            self._compact_plan_stream = torch.cuda.Stream()
+            # Off by default: a side stream breaks rocprofv3's serialized
+            # dispatch (EP kernels wait on each other) and it slows the GEMM
+            # it overlaps. AITER_MEGA_PLAN_SIDE_STREAM=1 restores the overlap.
+            self._compact_plan_stream = (
+                torch.cuda.Stream()
+                if os.environ.get("AITER_MEGA_PLAN_SIDE_STREAM", "0") == "1"
+                else None
+            )
             self._compact_plan_event = torch.cuda.Event()
             self._compact_plan_pending = False
             # Warm both hist/done slots and the capacity bucket: compiling
