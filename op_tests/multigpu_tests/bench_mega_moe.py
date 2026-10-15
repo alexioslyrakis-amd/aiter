@@ -826,11 +826,17 @@ class DeviceMoEPipeline:
         # surface the per-kernel timeline inside the graph on this build, so we
         # profile the actual graph (matches the measured per-layer wall) instead of
         # a separate eager pass.
+        # MEGA_PROF_EAGER=1 profiles eager passes instead: graph replays with a
+        # side stream mis-attribute kernel names on this build.
+        eager = os.environ.get("MEGA_PROF_EAGER", "0") == "1"
         with tprof.profile(
             activities=[tprof.ProfilerActivity.CPU, tprof.ProfilerActivity.CUDA]
         ) as prof:
             for _ in range(prof_replays):
-                self.graph.replay()
+                if eager:
+                    self._pipeline(self.x0_static)
+                else:
+                    self.graph.replay()
             torch.cuda.synchronize()
         self.comm.barrier()
         self._prof = prof
